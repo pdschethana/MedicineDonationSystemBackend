@@ -1,0 +1,14 @@
+package com.medicinedonation.enums;
+
+public enum DonationStatus {
+    PENDING_DOCTOR,
+    PENDING_PHARMACIST,
+    PENDING_DOCTOR_RECHECK,
+    PHARMACIST_REJECTED,
+    DOCTOR_APPROVED,
+    REJECTED_BY_DOCTOR,
+    PENDING_CUSTODY,
+    LIVE,
+    REQUESTED,
+    COLLECTED
+}
