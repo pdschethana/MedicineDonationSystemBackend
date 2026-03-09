@@ -10,7 +10,7 @@ import java.time.LocalDateTime;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class MedicineResponse {
+public class  MedicineResponse {
 
     private Long id;
     private String brandName;
