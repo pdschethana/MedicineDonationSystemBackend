@@ -7,7 +7,7 @@ public class SendToPharmacistRequest {
     private String doctorNotes;
 }*/
 
-package com.medicinedonation.dto.request;
+/*package com.medicinedonation.dto.request;
 
 import lombok.Data;
 
@@ -26,4 +26,22 @@ public class SendToPharmacistRequest {
         if (doctorNotes != null) return doctorNotes;
         return "Please verify this medicine";
     }
+}*/
+
+package com.medicinedonation.dto.request;
+
+import lombok.Data;
+import java.time.LocalDate;
+
+@Data
+public class SendToPharmacistRequest {
+
+    private String notes;
+
+    // ✅ NEW — doctor corrections passed with send-to-pharmacist
+    private String correctedBrandName;
+    private String correctedStrength;
+    private String correctedDosageForm;
+    private Integer correctedQuantity;
+    private LocalDate correctedExpiryDate;
 }

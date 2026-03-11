@@ -1159,7 +1159,7 @@ public class DoctorService {
 }*/
 
 
-package com.medicinedonation.service;
+/*package com.medicinedonation.service;
 
 import com.medicinedonation.dto.request.SendToPharmacistRequest;
 import com.medicinedonation.dto.request.VerificationRequest;
@@ -1460,6 +1460,2083 @@ public class DoctorService {
                         donationRepository.countByStatus(DonationStatus.COLLECTED));
 
         return counts;
+    }
+
+    // ─────────────────────────────────────────
+    // MAPPER
+    // ─────────────────────────────────────────
+
+    private DonationResponse mapToDonationResponseWithFlag(Donation donation) {
+        DonationResponse response = donorService.mapToDonationResponse(donation);
+
+        if (donation.getMedicine() == null) {
+            response.setDoctorNotes(
+                    (response.getDoctorNotes() != null ?
+                            response.getDoctorNotes() + " | " : "") +
+                            "⚠️ MEDICINE NOT IN DATABASE");
+        }
+
+        return response;
+    }
+}*/
+
+/*package com.medicinedonation.service;
+
+import com.medicinedonation.dto.request.SendToPharmacistRequest;
+import com.medicinedonation.dto.request.VerificationRequest;
+import com.medicinedonation.dto.response.DonationResponse;
+import com.medicinedonation.enums.DonationStatus;
+import com.medicinedonation.model.Donation;
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.model.PendingMedicine;
+import com.medicinedonation.model.User;
+import com.medicinedonation.repository.DonationRepository;
+import com.medicinedonation.repository.MedicineRepository;
+import com.medicinedonation.repository.PendingMedicineRepository;
+import com.medicinedonation.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+public class DoctorService {
+
+    @Autowired
+    private DonationRepository donationRepository;
+
+    @Autowired
+    private PendingMedicineRepository pendingMedicineRepository;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private DonorService donorService;
+
+    @Autowired
+    private MedicineRepository medicineRepository;
+
+    // ─────────────────────────────────────────
+    // GET PENDING DONATIONS
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPendingDonations() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET RECHECK LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getRecheckList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR_RECHECK)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET PHARMACIST REJECTED LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPharmacistRejectedList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PHARMACIST_REJECTED)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET DONATION BY ID
+    // ─────────────────────────────────────────
+
+    public DonationResponse getDonationById(Long id) {
+        Donation donation = donationRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + id));
+        return mapToDonationResponseWithFlag(donation);
+    }
+
+    // ─────────────────────────────────────────
+    // APPROVE DONATION
+    //
+    // 1. Save doctor corrections to donation (if any)
+    // 2. Use corrected details (or original if no correction) for DB check
+    // 3. Medicine already linked → approve directly
+    // 4. Corrected details exact match in DB → link + approve
+    // 5. No match → auto send to pharmacist with corrected details
+    // ─────────────────────────────────────────
+
+    public DonationResponse approveDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK) {
+            throw new RuntimeException(
+                    "Cannot approve donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ✅ Save doctor corrections if provided
+        applyDoctorCorrections(donation, request);
+        donationRepository.save(donation);
+
+        // ── Case 1: Medicine already linked by pharmacist → approve directly
+        if (donation.getMedicine() != null) {
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ✅ Use corrected details if available, else fall back to donor's original
+        String brandName  = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+        String strength   = hasCorrectedStrength(donation)
+                ? donation.getDoctorCorrectedStrength()
+                : donation.getStrength();
+        String dosageForm = hasCorrectedDosageForm(donation)
+                ? donation.getDoctorCorrectedDosageForm()
+                : donation.getDosageForm();
+
+        // ── Case 2: Check corrected details against DB
+        Optional<Medicine> matched =
+                medicineRepository
+                        .findByBrandNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCase(
+                                brandName, strength, dosageForm);
+
+        if (matched.isPresent()) {
+            // ✅ Match found — approve directly
+            donation.setMedicine(matched.get());
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 3: No match → auto send to pharmacist with corrected details
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Details not found in database — please verify";
+
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            // ✅ Use corrected brand name for pharmacist
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandName)           // corrected if doctor edited
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // REJECT DONATION
+    // ─────────────────────────────────────────
+
+    public DonationResponse rejectDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK &&
+                donation.getStatus() != DonationStatus.PHARMACIST_REJECTED) {
+            throw new RuntimeException(
+                    "Cannot reject donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        donation.setStatus(DonationStatus.REJECTED_BY_DOCTOR);
+        donation.setApprovedByDoctor(doctor);
+        donation.setRejectionReason(request.getRejectionReason());
+        donation.setDoctorNotes(request.getNotes());
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // SEND TO PHARMACIST
+    // ✅ Uses corrected details if doctor edited
+    // ✅ No longer blocked by getMedicine() != null
+    // ─────────────────────────────────────────
+
+    public DonationResponse sendToPharmacist(
+            Long donationId,
+            SendToPharmacistRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR) {
+            throw new RuntimeException(
+                    "Cannot send to pharmacist. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ✅ Save corrections if provided in this request
+        if (request.getCorrectedBrandName() != null && !request.getCorrectedBrandName().isBlank()) {
+            donation.setDoctorCorrectedBrandName(request.getCorrectedBrandName());
+        }
+        if (request.getCorrectedStrength() != null && !request.getCorrectedStrength().isBlank()) {
+            donation.setDoctorCorrectedStrength(request.getCorrectedStrength());
+        }
+        if (request.getCorrectedDosageForm() != null && !request.getCorrectedDosageForm().isBlank()) {
+            donation.setDoctorCorrectedDosageForm(request.getCorrectedDosageForm());
+        }
+        if (request.getCorrectedQuantity() != null) {
+            donation.setDoctorCorrectedQuantity(request.getCorrectedQuantity());
+        }
+        if (request.getCorrectedExpiryDate() != null) {
+            donation.setDoctorCorrectedExpiryDate(request.getCorrectedExpiryDate());
+        }
+        donationRepository.save(donation);
+
+        // ✅ Use corrected brand name for pharmacist if available
+        String brandForPharmacist = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Please verify this medicine";
+
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandForPharmacist)  // ✅ corrected brand name
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // GET VERIFICATION HISTORY
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getVerificationHistory(String doctorEmail) {
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        return donationRepository.findAll()
+                .stream()
+                .filter(d -> d.getApprovedByDoctor() != null &&
+                        d.getApprovedByDoctor().getId().equals(doctor.getId()))
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // DASHBOARD COUNTS
+    // ─────────────────────────────────────────
+
+    public Map<String, Long> getDashboardCounts() {
+        Map<String, Long> counts = new HashMap<>();
+
+        counts.put("pendingDoctor",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR));
+        counts.put("pendingDoctorRecheck",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR_RECHECK));
+        counts.put("pharmacistRejected",
+                donationRepository.countByStatus(DonationStatus.PHARMACIST_REJECTED));
+        counts.put("totalActedOn",
+                donationRepository.countByStatus(DonationStatus.DOCTOR_APPROVED) +
+                        donationRepository.countByStatus(DonationStatus.REJECTED_BY_DOCTOR) +
+                        donationRepository.countByStatus(DonationStatus.LIVE) +
+                        donationRepository.countByStatus(DonationStatus.COLLECTED));
+
+        return counts;
+    }
+
+    // ─────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────
+
+    private void applyDoctorCorrections(Donation donation, VerificationRequest request) {
+        if (request.getCorrectedBrandName() != null && !request.getCorrectedBrandName().isBlank()) {
+            donation.setDoctorCorrectedBrandName(request.getCorrectedBrandName());
+        }
+        if (request.getCorrectedStrength() != null && !request.getCorrectedStrength().isBlank()) {
+            donation.setDoctorCorrectedStrength(request.getCorrectedStrength());
+        }
+        if (request.getCorrectedDosageForm() != null && !request.getCorrectedDosageForm().isBlank()) {
+            donation.setDoctorCorrectedDosageForm(request.getCorrectedDosageForm());
+        }
+        if (request.getCorrectedQuantity() != null) {
+            donation.setDoctorCorrectedQuantity(request.getCorrectedQuantity());
+        }
+        if (request.getCorrectedExpiryDate() != null) {
+            donation.setDoctorCorrectedExpiryDate(request.getCorrectedExpiryDate());
+        }
+    }
+
+    private boolean hasCorrectedBrand(Donation d) {
+        return d.getDoctorCorrectedBrandName() != null &&
+                !d.getDoctorCorrectedBrandName().isBlank();
+    }
+
+    private boolean hasCorrectedStrength(Donation d) {
+        return d.getDoctorCorrectedStrength() != null &&
+                !d.getDoctorCorrectedStrength().isBlank();
+    }
+
+    private boolean hasCorrectedDosageForm(Donation d) {
+        return d.getDoctorCorrectedDosageForm() != null &&
+                !d.getDoctorCorrectedDosageForm().isBlank();
+    }
+
+    // ─────────────────────────────────────────
+    // MAPPER
+    // ─────────────────────────────────────────
+
+    private DonationResponse mapToDonationResponseWithFlag(Donation donation) {
+        DonationResponse response = donorService.mapToDonationResponse(donation);
+
+        if (donation.getMedicine() == null) {
+            response.setDoctorNotes(
+                    (response.getDoctorNotes() != null ?
+                            response.getDoctorNotes() + " | " : "") +
+                            "⚠️ MEDICINE NOT IN DATABASE");
+        }
+
+        return response;
+    }
+}*/
+
+
+/*package com.medicinedonation.service;
+
+import com.medicinedonation.dto.request.SendToPharmacistRequest;
+import com.medicinedonation.dto.request.VerificationRequest;
+import com.medicinedonation.dto.response.DonationResponse;
+import com.medicinedonation.enums.DonationStatus;
+import com.medicinedonation.model.Donation;
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.model.PendingMedicine;
+import com.medicinedonation.model.User;
+import com.medicinedonation.repository.DonationRepository;
+import com.medicinedonation.repository.MedicineRepository;
+import com.medicinedonation.repository.PendingMedicineRepository;
+import com.medicinedonation.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+public class DoctorService {
+
+    @Autowired
+    private DonationRepository donationRepository;
+
+    @Autowired
+    private PendingMedicineRepository pendingMedicineRepository;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private DonorService donorService;
+
+    @Autowired
+    private MedicineRepository medicineRepository;
+
+    // ─────────────────────────────────────────
+    // GET PENDING DONATIONS
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPendingDonations() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET RECHECK LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getRecheckList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR_RECHECK)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET PHARMACIST REJECTED LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPharmacistRejectedList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PHARMACIST_REJECTED)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET DONATION BY ID
+    // ─────────────────────────────────────────
+
+    public DonationResponse getDonationById(Long id) {
+        Donation donation = donationRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + id));
+        return mapToDonationResponseWithFlag(donation);
+    }
+
+    // ─────────────────────────────────────────
+    // APPROVE DONATION
+    //
+    // 1. Medicine already linked (pharmacist verified) → approve directly
+    // 2. Brand + strength + dosageForm exact match in DB → link + approve
+    // 3. No match → auto send to pharmacist
+    // ─────────────────────────────────────────
+
+    public DonationResponse approveDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK) {
+            throw new RuntimeException(
+                    "Cannot approve donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ── Case 1: Medicine already linked by pharmacist → approve directly
+        if (donation.getMedicine() != null) {
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 2: Check corrected details (if any) or original against DB
+        // ✅ Use doctor's corrected details first, fall back to donor's original
+        String brandName  = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+        String strength   = hasCorrectedStrength(donation)
+                ? donation.getDoctorCorrectedStrength()
+                : donation.getStrength();
+        String dosageForm = hasCorrectedDosageForm(donation)
+                ? donation.getDoctorCorrectedDosageForm()
+                : donation.getDosageForm();
+
+        Optional<Medicine> matched =
+                medicineRepository
+                        .findByBrandNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCase(
+                                brandName, strength, dosageForm);
+
+        if (matched.isPresent()) {
+            donation.setMedicine(matched.get());
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 3: No exact match → auto send to pharmacist
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Brand name, strength or dosage form not found in database — please verify";
+
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandName)
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // REJECT DONATION
+    // ─────────────────────────────────────────
+
+    public DonationResponse rejectDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK &&
+                donation.getStatus() != DonationStatus.PHARMACIST_REJECTED) {
+            throw new RuntimeException(
+                    "Cannot reject donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        donation.setStatus(DonationStatus.REJECTED_BY_DOCTOR);
+        donation.setApprovedByDoctor(doctor);
+        donation.setRejectionReason(request.getRejectionReason());
+        donation.setDoctorNotes(request.getNotes());
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // SEND TO PHARMACIST
+    //
+    // ✅ FIXED — removed the getMedicine() != null block
+    // PARTIAL_MATCH has medicine linked (brand found) but
+    // strength/dosageForm differ — pharmacist still needs to verify
+    // ─────────────────────────────────────────
+
+    public DonationResponse sendToPharmacist(
+            Long donationId,
+            SendToPharmacistRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR) {
+            throw new RuntimeException(
+                    "Cannot send to pharmacist. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        // ✅ REMOVED: the old check that blocked PARTIAL_MATCH from going to pharmacist:
+        // if (donation.getMedicine() != null) { throw new RuntimeException(...) }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ✅ Use corrected brand name if available
+        String brandForPharmacist = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Please verify this medicine";
+
+        // Avoid duplicate pending entries for same donation
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandForPharmacist)
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // RECHECK CORRECTIONS
+    //
+    // Saves doctor's corrected fields to DB,
+    // then returns updated donation with new dbMatchStatus.
+    // Frontend reloads → Approve button appears if FULL_MATCH.
+    // Does NOT change donation status.
+    // ─────────────────────────────────────────
+
+    public DonationResponse recheckCorrections(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR) {
+            throw new RuntimeException(
+                    "Can only re-check corrections for donations pending doctor review. " +
+                            "Current status: " + donation.getStatus().name());
+        }
+
+        // Validate doctor exists
+        userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // Save corrections — status unchanged
+        applyDoctorCorrections(donation, request);
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // GET VERIFICATION HISTORY
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getVerificationHistory(String doctorEmail) {
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        return donationRepository.findAll()
+                .stream()
+                .filter(d -> d.getApprovedByDoctor() != null &&
+                        d.getApprovedByDoctor().getId().equals(doctor.getId()))
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // DASHBOARD COUNTS
+    // ─────────────────────────────────────────
+
+    public Map<String, Long> getDashboardCounts() {
+        Map<String, Long> counts = new HashMap<>();
+
+        counts.put("pendingDoctor",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR));
+
+        counts.put("pendingDoctorRecheck",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR_RECHECK));
+
+        counts.put("pharmacistRejected",
+                donationRepository.countByStatus(DonationStatus.PHARMACIST_REJECTED));
+
+        counts.put("totalActedOn",
+                donationRepository.countByStatus(DonationStatus.DOCTOR_APPROVED) +
+                        donationRepository.countByStatus(DonationStatus.REJECTED_BY_DOCTOR) +
+                        donationRepository.countByStatus(DonationStatus.LIVE) +
+                        donationRepository.countByStatus(DonationStatus.COLLECTED));
+
+        return counts;
+    }
+
+    // ─────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────
+
+    private void applyDoctorCorrections(Donation donation, VerificationRequest request) {
+        if (request.getCorrectedBrandName() != null && !request.getCorrectedBrandName().isBlank()) {
+            donation.setDoctorCorrectedBrandName(request.getCorrectedBrandName());
+        }
+        if (request.getCorrectedStrength() != null && !request.getCorrectedStrength().isBlank()) {
+            donation.setDoctorCorrectedStrength(request.getCorrectedStrength());
+        }
+        if (request.getCorrectedDosageForm() != null && !request.getCorrectedDosageForm().isBlank()) {
+            donation.setDoctorCorrectedDosageForm(request.getCorrectedDosageForm());
+        }
+        if (request.getCorrectedQuantity() != null) {
+            donation.setDoctorCorrectedQuantity(request.getCorrectedQuantity());
+        }
+        if (request.getCorrectedExpiryDate() != null) {
+            donation.setDoctorCorrectedExpiryDate(request.getCorrectedExpiryDate());
+        }
+    }
+
+    private boolean hasCorrectedBrand(Donation d) {
+        return d.getDoctorCorrectedBrandName() != null &&
+                !d.getDoctorCorrectedBrandName().isBlank();
+    }
+
+    private boolean hasCorrectedStrength(Donation d) {
+        return d.getDoctorCorrectedStrength() != null &&
+                !d.getDoctorCorrectedStrength().isBlank();
+    }
+
+    private boolean hasCorrectedDosageForm(Donation d) {
+        return d.getDoctorCorrectedDosageForm() != null &&
+                !d.getDoctorCorrectedDosageForm().isBlank();
+    }
+
+    // ─────────────────────────────────────────
+    // MAPPER
+    // ─────────────────────────────────────────
+
+    private DonationResponse mapToDonationResponseWithFlag(Donation donation) {
+        DonationResponse response = donorService.mapToDonationResponse(donation);
+
+        if (donation.getMedicine() == null) {
+            response.setDoctorNotes(
+                    (response.getDoctorNotes() != null ?
+                            response.getDoctorNotes() + " | " : "") +
+                            "⚠️ MEDICINE NOT IN DATABASE");
+        }
+
+        return response;
+    }
+}*/
+
+/*package com.medicinedonation.service;
+
+import com.medicinedonation.dto.request.SendToPharmacistRequest;
+import com.medicinedonation.dto.request.VerificationRequest;
+import com.medicinedonation.dto.response.DonationResponse;
+import com.medicinedonation.enums.DonationStatus;
+import com.medicinedonation.model.Donation;
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.model.PendingMedicine;
+import com.medicinedonation.model.User;
+import com.medicinedonation.repository.DonationRepository;
+import com.medicinedonation.repository.MedicineRepository;
+import com.medicinedonation.repository.PendingMedicineRepository;
+import com.medicinedonation.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+public class DoctorService {
+
+    @Autowired
+    private DonationRepository donationRepository;
+
+    @Autowired
+    private PendingMedicineRepository pendingMedicineRepository;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private DonorService donorService;
+
+    @Autowired
+    private MedicineRepository medicineRepository;
+
+    // ─────────────────────────────────────────
+    // GET PENDING DONATIONS
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPendingDonations() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET RECHECK LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getRecheckList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR_RECHECK)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET PHARMACIST REJECTED LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPharmacistRejectedList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PHARMACIST_REJECTED)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET DONATION BY ID
+    // ─────────────────────────────────────────
+
+    public DonationResponse getDonationById(Long id) {
+        Donation donation = donationRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + id));
+        return mapToDonationResponseWithFlag(donation);
+    }
+
+    // ─────────────────────────────────────────
+    // APPROVE DONATION
+    //
+    // 1. Medicine already linked (pharmacist verified) → approve directly
+    // 2. Brand + strength + dosageForm exact match in DB → link + approve
+    // 3. No match → auto send to pharmacist
+    // ─────────────────────────────────────────
+
+    public DonationResponse approveDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK) {
+            throw new RuntimeException(
+                    "Cannot approve donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ── Case 1: Medicine already linked by pharmacist → approve directly
+        if (donation.getMedicine() != null) {
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 2: Check corrected details (if any) or original against DB
+        // ✅ Use doctor's corrected details first, fall back to donor's original
+        String brandName  = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+        String strength   = hasCorrectedStrength(donation)
+                ? donation.getDoctorCorrectedStrength()
+                : donation.getStrength();
+        String dosageForm = hasCorrectedDosageForm(donation)
+                ? donation.getDoctorCorrectedDosageForm()
+                : donation.getDosageForm();
+
+        // ✅ FIXED — List instead of Optional, safe when multiple entries share same brand name
+        List<Medicine> matched =
+                medicineRepository
+                        .findByBrandNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCase(
+                                brandName, strength, dosageForm);
+
+        if (!matched.isEmpty()) {
+            donation.setMedicine(matched.get(0));
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 3: No exact match → auto send to pharmacist
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Brand name, strength or dosage form not found in database — please verify";
+
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandName)
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // REJECT DONATION
+    // ─────────────────────────────────────────
+
+    public DonationResponse rejectDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK &&
+                donation.getStatus() != DonationStatus.PHARMACIST_REJECTED) {
+            throw new RuntimeException(
+                    "Cannot reject donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        donation.setStatus(DonationStatus.REJECTED_BY_DOCTOR);
+        donation.setApprovedByDoctor(doctor);
+        donation.setRejectionReason(request.getRejectionReason());
+        donation.setDoctorNotes(request.getNotes());
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // SEND TO PHARMACIST
+    //
+    // ✅ FIXED — removed the getMedicine() != null block
+    // PARTIAL_MATCH has medicine linked (brand found) but
+    // strength/dosageForm differ — pharmacist still needs to verify
+    // ─────────────────────────────────────────
+
+    public DonationResponse sendToPharmacist(
+            Long donationId,
+            SendToPharmacistRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR) {
+            throw new RuntimeException(
+                    "Cannot send to pharmacist. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        // ✅ REMOVED: the old check that blocked PARTIAL_MATCH from going to pharmacist:
+        // if (donation.getMedicine() != null) { throw new RuntimeException(...) }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ✅ Use corrected brand name if available
+        String brandForPharmacist = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Please verify this medicine";
+
+        // Avoid duplicate pending entries for same donation
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandForPharmacist)
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // RECHECK CORRECTIONS
+    //
+    // Saves doctor's corrected fields to DB,
+    // then returns updated donation with new dbMatchStatus.
+    // Frontend reloads → Approve button appears if FULL_MATCH.
+    // Does NOT change donation status.
+    // ─────────────────────────────────────────
+
+    public DonationResponse recheckCorrections(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR) {
+            throw new RuntimeException(
+                    "Can only re-check corrections for donations pending doctor review. " +
+                            "Current status: " + donation.getStatus().name());
+        }
+
+        // Validate doctor exists
+        userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // Save corrections — status unchanged
+        applyDoctorCorrections(donation, request);
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // GET VERIFICATION HISTORY
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getVerificationHistory(String doctorEmail) {
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        return donationRepository.findAll()
+                .stream()
+                .filter(d -> d.getApprovedByDoctor() != null &&
+                        d.getApprovedByDoctor().getId().equals(doctor.getId()))
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // DASHBOARD COUNTS
+    // ─────────────────────────────────────────
+
+    public Map<String, Long> getDashboardCounts() {
+        Map<String, Long> counts = new HashMap<>();
+
+        counts.put("pendingDoctor",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR));
+
+        counts.put("pendingDoctorRecheck",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR_RECHECK));
+
+        counts.put("pharmacistRejected",
+                donationRepository.countByStatus(DonationStatus.PHARMACIST_REJECTED));
+
+        counts.put("totalActedOn",
+                donationRepository.countByStatus(DonationStatus.DOCTOR_APPROVED) +
+                        donationRepository.countByStatus(DonationStatus.REJECTED_BY_DOCTOR) +
+                        donationRepository.countByStatus(DonationStatus.LIVE) +
+                        donationRepository.countByStatus(DonationStatus.COLLECTED));
+
+        return counts;
+    }
+
+    // ─────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────
+
+    private void applyDoctorCorrections(Donation donation, VerificationRequest request) {
+        if (request.getCorrectedBrandName() != null && !request.getCorrectedBrandName().isBlank()) {
+            donation.setDoctorCorrectedBrandName(request.getCorrectedBrandName());
+        }
+        if (request.getCorrectedStrength() != null && !request.getCorrectedStrength().isBlank()) {
+            donation.setDoctorCorrectedStrength(request.getCorrectedStrength());
+        }
+        if (request.getCorrectedDosageForm() != null && !request.getCorrectedDosageForm().isBlank()) {
+            donation.setDoctorCorrectedDosageForm(request.getCorrectedDosageForm());
+        }
+        if (request.getCorrectedQuantity() != null) {
+            donation.setDoctorCorrectedQuantity(request.getCorrectedQuantity());
+        }
+        if (request.getCorrectedExpiryDate() != null) {
+            donation.setDoctorCorrectedExpiryDate(request.getCorrectedExpiryDate());
+        }
+    }
+
+    private boolean hasCorrectedBrand(Donation d) {
+        return d.getDoctorCorrectedBrandName() != null &&
+                !d.getDoctorCorrectedBrandName().isBlank();
+    }
+
+    private boolean hasCorrectedStrength(Donation d) {
+        return d.getDoctorCorrectedStrength() != null &&
+                !d.getDoctorCorrectedStrength().isBlank();
+    }
+
+    private boolean hasCorrectedDosageForm(Donation d) {
+        return d.getDoctorCorrectedDosageForm() != null &&
+                !d.getDoctorCorrectedDosageForm().isBlank();
+    }
+
+    // ─────────────────────────────────────────
+    // MAPPER
+    // ─────────────────────────────────────────
+
+    private DonationResponse mapToDonationResponseWithFlag(Donation donation) {
+        DonationResponse response = donorService.mapToDonationResponse(donation);
+
+        if (donation.getMedicine() == null) {
+            response.setDoctorNotes(
+                    (response.getDoctorNotes() != null ?
+                            response.getDoctorNotes() + " | " : "") +
+                            "⚠️ MEDICINE NOT IN DATABASE");
+        }
+
+        return response;
+    }
+}*/
+
+
+/*package com.medicinedonation.service;
+
+import com.medicinedonation.dto.request.SendToPharmacistRequest;
+import com.medicinedonation.dto.request.VerificationRequest;
+import com.medicinedonation.dto.response.DonationResponse;
+import com.medicinedonation.enums.DonationStatus;
+import com.medicinedonation.model.Donation;
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.model.PendingMedicine;
+import com.medicinedonation.model.User;
+import com.medicinedonation.repository.DonationRepository;
+import com.medicinedonation.repository.MedicineRepository;
+import com.medicinedonation.repository.PendingMedicineRepository;
+import com.medicinedonation.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+public class DoctorService {
+
+    @Autowired
+    private DonationRepository donationRepository;
+
+    @Autowired
+    private PendingMedicineRepository pendingMedicineRepository;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private DonorService donorService;
+
+    @Autowired
+    private MedicineRepository medicineRepository;
+
+    // ─────────────────────────────────────────
+    // GET PENDING DONATIONS
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPendingDonations() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET RECHECK LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getRecheckList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR_RECHECK)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET PHARMACIST REJECTED LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPharmacistRejectedList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PHARMACIST_REJECTED)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET DONATION BY ID
+    // ─────────────────────────────────────────
+
+    public DonationResponse getDonationById(Long id) {
+        Donation donation = donationRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + id));
+        return mapToDonationResponseWithFlag(donation);
+    }
+
+    // ─────────────────────────────────────────
+    // APPROVE DONATION
+    //
+    // 1. Medicine already linked (pharmacist verified) → approve directly
+    // 2. Brand + strength + dosageForm exact match in DB → link + approve
+    // 3. No match → auto send to pharmacist
+    // ─────────────────────────────────────────
+
+    public DonationResponse approveDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK) {
+            throw new RuntimeException(
+                    "Cannot approve donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ── Case 1: Medicine already linked — but re-check correct variant
+        // e.g. Panadol 500mg linked, but donor/doctor wants Panadol 1mg → re-link to correct one
+        if (donation.getMedicine() != null) {
+            String brandName  = hasCorrectedBrand(donation)
+                    ? donation.getDoctorCorrectedBrandName()
+                    : donation.getBrandNameSubmitted();
+            String strength   = hasCorrectedStrength(donation)
+                    ? donation.getDoctorCorrectedStrength()
+                    : donation.getStrength();
+            String dosageForm = hasCorrectedDosageForm(donation)
+                    ? donation.getDoctorCorrectedDosageForm()
+                    : donation.getDosageForm();
+
+            // Try to find exact matching variant
+            List<Medicine> matched =
+                    medicineRepository
+                            .findByBrandNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCase(
+                                    brandName, strength, dosageForm);
+
+            if (!matched.isEmpty()) {
+                // Re-link to the correct variant (may differ from originally linked one)
+                donation.setMedicine(matched.get(0));
+            }
+            // If no exact match found, keep the existing linked medicine
+
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 2: Check corrected details (if any) or original against DB
+        // ✅ Use doctor's corrected details first, fall back to donor's original
+        String brandName  = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+        String strength   = hasCorrectedStrength(donation)
+                ? donation.getDoctorCorrectedStrength()
+                : donation.getStrength();
+        String dosageForm = hasCorrectedDosageForm(donation)
+                ? donation.getDoctorCorrectedDosageForm()
+                : donation.getDosageForm();
+
+        // ✅ FIXED — List instead of Optional, safe when multiple entries share same brand name
+        List<Medicine> matched =
+                medicineRepository
+                        .findByBrandNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCase(
+                                brandName, strength, dosageForm);
+
+        if (!matched.isEmpty()) {
+            donation.setMedicine(matched.get(0));
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 3: No exact match → auto send to pharmacist
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Brand name, strength or dosage form not found in database — please verify";
+
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandName)
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // REJECT DONATION
+    // ─────────────────────────────────────────
+
+    public DonationResponse rejectDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK &&
+                donation.getStatus() != DonationStatus.PHARMACIST_REJECTED) {
+            throw new RuntimeException(
+                    "Cannot reject donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        donation.setStatus(DonationStatus.REJECTED_BY_DOCTOR);
+        donation.setApprovedByDoctor(doctor);
+        donation.setRejectionReason(request.getRejectionReason());
+        donation.setDoctorNotes(request.getNotes());
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // SEND TO PHARMACIST
+    //
+    // ✅ FIXED — removed the getMedicine() != null block
+    // PARTIAL_MATCH has medicine linked (brand found) but
+    // strength/dosageForm differ — pharmacist still needs to verify
+    // ─────────────────────────────────────────
+
+    public DonationResponse sendToPharmacist(
+            Long donationId,
+            SendToPharmacistRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR) {
+            throw new RuntimeException(
+                    "Cannot send to pharmacist. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        // ✅ REMOVED: the old check that blocked PARTIAL_MATCH from going to pharmacist:
+        // if (donation.getMedicine() != null) { throw new RuntimeException(...) }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ✅ Use corrected brand name if available
+        String brandForPharmacist = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Please verify this medicine";
+
+        // Avoid duplicate pending entries for same donation
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandForPharmacist)
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // RECHECK CORRECTIONS
+    //
+    // Saves doctor's corrected fields to DB,
+    // then returns updated donation with new dbMatchStatus.
+    // Frontend reloads → Approve button appears if FULL_MATCH.
+    // Does NOT change donation status.
+    // ─────────────────────────────────────────
+
+    public DonationResponse recheckCorrections(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR) {
+            throw new RuntimeException(
+                    "Can only re-check corrections for donations pending doctor review. " +
+                            "Current status: " + donation.getStatus().name());
+        }
+
+        // Validate doctor exists
+        userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // Save corrections — status unchanged
+        applyDoctorCorrections(donation, request);
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // GET VERIFICATION HISTORY
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getVerificationHistory(String doctorEmail) {
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        return donationRepository.findAll()
+                .stream()
+                .filter(d -> d.getApprovedByDoctor() != null &&
+                        d.getApprovedByDoctor().getId().equals(doctor.getId()))
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // DASHBOARD COUNTS
+    // ─────────────────────────────────────────
+
+    public Map<String, Long> getDashboardCounts() {
+        Map<String, Long> counts = new HashMap<>();
+
+        counts.put("pendingDoctor",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR));
+
+        counts.put("pendingDoctorRecheck",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR_RECHECK));
+
+        counts.put("pharmacistRejected",
+                donationRepository.countByStatus(DonationStatus.PHARMACIST_REJECTED));
+
+        counts.put("totalActedOn",
+                donationRepository.countByStatus(DonationStatus.DOCTOR_APPROVED) +
+                        donationRepository.countByStatus(DonationStatus.REJECTED_BY_DOCTOR) +
+                        donationRepository.countByStatus(DonationStatus.LIVE) +
+                        donationRepository.countByStatus(DonationStatus.COLLECTED));
+
+        return counts;
+    }
+
+    // ─────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────
+
+    private void applyDoctorCorrections(Donation donation, VerificationRequest request) {
+        if (request.getCorrectedBrandName() != null && !request.getCorrectedBrandName().isBlank()) {
+            donation.setDoctorCorrectedBrandName(request.getCorrectedBrandName());
+        }
+        if (request.getCorrectedStrength() != null && !request.getCorrectedStrength().isBlank()) {
+            donation.setDoctorCorrectedStrength(request.getCorrectedStrength());
+        }
+        if (request.getCorrectedDosageForm() != null && !request.getCorrectedDosageForm().isBlank()) {
+            donation.setDoctorCorrectedDosageForm(request.getCorrectedDosageForm());
+        }
+        if (request.getCorrectedQuantity() != null) {
+            donation.setDoctorCorrectedQuantity(request.getCorrectedQuantity());
+        }
+        if (request.getCorrectedExpiryDate() != null) {
+            donation.setDoctorCorrectedExpiryDate(request.getCorrectedExpiryDate());
+        }
+    }
+
+    private boolean hasCorrectedBrand(Donation d) {
+        return d.getDoctorCorrectedBrandName() != null &&
+                !d.getDoctorCorrectedBrandName().isBlank();
+    }
+
+    private boolean hasCorrectedStrength(Donation d) {
+        return d.getDoctorCorrectedStrength() != null &&
+                !d.getDoctorCorrectedStrength().isBlank();
+    }
+
+    private boolean hasCorrectedDosageForm(Donation d) {
+        return d.getDoctorCorrectedDosageForm() != null &&
+                !d.getDoctorCorrectedDosageForm().isBlank();
+    }
+
+    // ─────────────────────────────────────────
+    // MAPPER
+    // ─────────────────────────────────────────
+
+    private DonationResponse mapToDonationResponseWithFlag(Donation donation) {
+        DonationResponse response = donorService.mapToDonationResponse(donation);
+
+        if (donation.getMedicine() == null) {
+            response.setDoctorNotes(
+                    (response.getDoctorNotes() != null ?
+                            response.getDoctorNotes() + " | " : "") +
+                            "⚠️ MEDICINE NOT IN DATABASE");
+        }
+
+        return response;
+    }
+}*/
+
+package com.medicinedonation.service;
+
+import com.medicinedonation.dto.request.SendToPharmacistRequest;
+import com.medicinedonation.dto.request.VerificationRequest;
+import com.medicinedonation.dto.response.DonationResponse;
+import com.medicinedonation.enums.DonationStatus;
+import com.medicinedonation.model.Donation;
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.model.PendingMedicine;
+import com.medicinedonation.model.User;
+import com.medicinedonation.repository.DonationRepository;
+import com.medicinedonation.repository.MedicineRepository;
+import com.medicinedonation.repository.PendingMedicineRepository;
+import com.medicinedonation.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+public class DoctorService {
+
+    @Autowired
+    private DonationRepository donationRepository;
+
+    @Autowired
+    private PendingMedicineRepository pendingMedicineRepository;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private DonorService donorService;
+
+    @Autowired
+    private MedicineRepository medicineRepository;
+
+    // ─────────────────────────────────────────
+    // GET PENDING DONATIONS
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPendingDonations() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET RECHECK LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getRecheckList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PENDING_DOCTOR_RECHECK)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET PHARMACIST REJECTED LIST
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getPharmacistRejectedList() {
+        return donationRepository
+                .findByStatus(DonationStatus.PHARMACIST_REJECTED)
+                .stream()
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET DONATION BY ID
+    // ─────────────────────────────────────────
+
+    public DonationResponse getDonationById(Long id) {
+        Donation donation = donationRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + id));
+        return mapToDonationResponseWithFlag(donation);
+    }
+
+    // ─────────────────────────────────────────
+    // APPROVE DONATION
+    //
+    // 1. Medicine already linked (pharmacist verified) → approve directly
+    // 2. Brand + strength + dosageForm exact match in DB → link + approve
+    // 3. No match → auto send to pharmacist
+    // ─────────────────────────────────────────
+
+    public DonationResponse approveDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK) {
+            throw new RuntimeException(
+                    "Cannot approve donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ── Case 1: Medicine already linked — but re-check correct variant
+        // e.g. Panadol 500mg linked, but donor/doctor wants Panadol 1mg → re-link to correct one
+        if (donation.getMedicine() != null) {
+            String brandName  = hasCorrectedBrand(donation)
+                    ? donation.getDoctorCorrectedBrandName()
+                    : donation.getBrandNameSubmitted();
+            String strength   = hasCorrectedStrength(donation)
+                    ? donation.getDoctorCorrectedStrength()
+                    : donation.getStrength();
+            String dosageForm = hasCorrectedDosageForm(donation)
+                    ? donation.getDoctorCorrectedDosageForm()
+                    : donation.getDosageForm();
+
+            // ✅ Use space-normalized match — fixes "500mg" vs "500 mg" mismatch
+            Medicine bestMatch = findBestMatch(brandName, strength, dosageForm);
+            if (bestMatch != null) {
+                // Re-link to the correct variant (may differ from originally linked one)
+                donation.setMedicine(bestMatch);
+            }
+            // If no exact match found, keep the existing linked medicine
+
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 2: Check corrected details (if any) or original against DB
+        // ✅ Use doctor's corrected details first, fall back to donor's original
+        String brandName  = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+        String strength   = hasCorrectedStrength(donation)
+                ? donation.getDoctorCorrectedStrength()
+                : donation.getStrength();
+        String dosageForm = hasCorrectedDosageForm(donation)
+                ? donation.getDoctorCorrectedDosageForm()
+                : donation.getDosageForm();
+
+        // ✅ Space-normalized match — "500mg" == "500 mg"
+        Medicine bestMatch = findBestMatch(brandName, strength, dosageForm);
+
+        if (bestMatch != null) {
+            donation.setMedicine(bestMatch);
+            donation.setStatus(DonationStatus.DOCTOR_APPROVED);
+            donation.setApprovedByDoctor(doctor);
+            donation.setDoctorNotes(request.getNotes());
+            return mapToDonationResponseWithFlag(donationRepository.save(donation));
+        }
+
+        // ── Case 3: No exact match → auto send to pharmacist
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Brand name, strength or dosage form not found in database — please verify";
+
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandName)
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // REJECT DONATION
+    // ─────────────────────────────────────────
+
+    public DonationResponse rejectDonation(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK &&
+                donation.getStatus() != DonationStatus.PHARMACIST_REJECTED) {
+            throw new RuntimeException(
+                    "Cannot reject donation. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        donation.setStatus(DonationStatus.REJECTED_BY_DOCTOR);
+        donation.setApprovedByDoctor(doctor);
+        donation.setRejectionReason(request.getRejectionReason());
+        donation.setDoctorNotes(request.getNotes());
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // SEND TO PHARMACIST
+    //
+    // ✅ FIXED — removed the getMedicine() != null block
+    // PARTIAL_MATCH has medicine linked (brand found) but
+    // strength/dosageForm differ — pharmacist still needs to verify
+    // ─────────────────────────────────────────
+
+    public DonationResponse sendToPharmacist(
+            Long donationId,
+            SendToPharmacistRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK &&
+                donation.getStatus() != DonationStatus.PHARMACIST_REJECTED) {
+            throw new RuntimeException(
+                    "Cannot send to pharmacist. Current status is: " +
+                            donation.getStatus().name());
+        }
+
+        // ✅ REMOVED: the old check that blocked PARTIAL_MATCH from going to pharmacist:
+        // if (donation.getMedicine() != null) { throw new RuntimeException(...) }
+
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // ✅ Use corrected brand name if available
+        String brandForPharmacist = hasCorrectedBrand(donation)
+                ? donation.getDoctorCorrectedBrandName()
+                : donation.getBrandNameSubmitted();
+
+        String doctorNotes = (request.getNotes() != null && !request.getNotes().isBlank())
+                ? request.getNotes()
+                : "Please verify this medicine";
+
+        // Avoid duplicate pending entries for same donation
+        boolean alreadyPending = pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .anyMatch(p -> p.getDonation().getId().equals(donationId));
+
+        if (!alreadyPending) {
+            PendingMedicine pendingMedicine = PendingMedicine.builder()
+                    .donation(donation)
+                    .brandName(brandForPharmacist)
+                    .photoUrl(donation.getPhotoUrl())
+                    .packageInsertUrl(donation.getPackageProofUrl())
+                    .doctorNotes(doctorNotes)
+                    .resolved(false)
+                    .rejected(false)
+                    .build();
+            pendingMedicineRepository.save(pendingMedicine);
+        }
+
+        donation.setStatus(DonationStatus.PENDING_PHARMACIST);
+        donation.setApprovedByDoctor(doctor);
+        donation.setDoctorNotes(doctorNotes);
+
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // RECHECK CORRECTIONS
+    //
+    // Saves doctor's corrected fields to DB,
+    // then returns updated donation with new dbMatchStatus.
+    // Frontend reloads → Approve button appears if FULL_MATCH.
+    // Does NOT change donation status.
+    // ─────────────────────────────────────────
+
+    public DonationResponse recheckCorrections(
+            Long donationId,
+            VerificationRequest request,
+            String doctorEmail) {
+
+        Donation donation = donationRepository.findById(donationId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Donation not found with id: " + donationId));
+
+        if (donation.getStatus() != DonationStatus.PENDING_DOCTOR &&
+                donation.getStatus() != DonationStatus.PENDING_DOCTOR_RECHECK &&
+                donation.getStatus() != DonationStatus.PHARMACIST_REJECTED) {
+            throw new RuntimeException(
+                    "Can only re-check corrections for donations pending doctor review. " +
+                            "Current status: " + donation.getStatus().name());
+        }
+
+        // Validate doctor exists
+        userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        // Save corrections — status unchanged
+        applyDoctorCorrections(donation, request);
+        return mapToDonationResponseWithFlag(donationRepository.save(donation));
+    }
+
+    // ─────────────────────────────────────────
+    // GET VERIFICATION HISTORY
+    // ─────────────────────────────────────────
+
+    public List<DonationResponse> getVerificationHistory(String doctorEmail) {
+        User doctor = userRepository.findByEmail(doctorEmail)
+                .orElseThrow(() -> new RuntimeException("Doctor not found"));
+
+        return donationRepository.findAll()
+                .stream()
+                .filter(d -> d.getApprovedByDoctor() != null &&
+                        d.getApprovedByDoctor().getId().equals(doctor.getId()))
+                .map(this::mapToDonationResponseWithFlag)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // DASHBOARD COUNTS
+    // ─────────────────────────────────────────
+
+    public Map<String, Long> getDashboardCounts() {
+        Map<String, Long> counts = new HashMap<>();
+
+        counts.put("pendingDoctor",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR));
+
+        counts.put("pendingDoctorRecheck",
+                donationRepository.countByStatus(DonationStatus.PENDING_DOCTOR_RECHECK));
+
+        counts.put("pharmacistRejected",
+                donationRepository.countByStatus(DonationStatus.PHARMACIST_REJECTED));
+
+        counts.put("totalActedOn",
+                donationRepository.countByStatus(DonationStatus.DOCTOR_APPROVED) +
+                        donationRepository.countByStatus(DonationStatus.REJECTED_BY_DOCTOR) +
+                        donationRepository.countByStatus(DonationStatus.LIVE) +
+                        donationRepository.countByStatus(DonationStatus.COLLECTED));
+
+        return counts;
+    }
+
+    // ─────────────────────────────────────────
+    // FIND BEST MATCHING MEDICINE
+    // Uses brand lookup + Java-side strength normalization
+    // Fixes: "500mg" == "500 mg" mismatch that breaks IgnoreCase DB query
+    // ─────────────────────────────────────────
+
+    private Medicine findBestMatch(String brandName, String strength, String dosageForm) {
+        if (brandName == null || brandName.isBlank()) return null;
+
+        // Normalize brand and strength for comparison
+        String normBrand    = brandName.trim().replaceAll("\\s+", " ");
+        String normStrength = strength  != null ? strength.trim().replaceAll("\\s+", "").toLowerCase() : "";
+        String normDosage   = dosageForm != null ? dosageForm.trim().toLowerCase() : "";
+
+        // Get all records for this brand
+        List<Medicine> byBrand = medicineRepository.findByBrandNameIgnoreCase(normBrand);
+
+        // Find one where strength and dosageForm match (space-normalized)
+        return byBrand.stream()
+                .filter(m -> {
+                    String mStrength = m.getStrength() != null
+                            ? m.getStrength().trim().replaceAll("\\s+", "").toLowerCase() : "";
+                    String mDosage   = m.getDosageForm() != null
+                            ? m.getDosageForm().trim().toLowerCase() : "";
+                    return mStrength.equals(normStrength) && mDosage.equals(normDosage);
+                })
+                .findFirst()
+                .orElse(null);
+    }
+
+    // ─────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────
+
+    private void applyDoctorCorrections(Donation donation, VerificationRequest request) {
+        if (request.getCorrectedBrandName() != null && !request.getCorrectedBrandName().isBlank()) {
+            donation.setDoctorCorrectedBrandName(request.getCorrectedBrandName());
+        }
+        if (request.getCorrectedStrength() != null && !request.getCorrectedStrength().isBlank()) {
+            donation.setDoctorCorrectedStrength(request.getCorrectedStrength());
+        }
+        if (request.getCorrectedDosageForm() != null && !request.getCorrectedDosageForm().isBlank()) {
+            donation.setDoctorCorrectedDosageForm(request.getCorrectedDosageForm());
+        }
+        if (request.getCorrectedQuantity() != null) {
+            donation.setDoctorCorrectedQuantity(request.getCorrectedQuantity());
+        }
+        if (request.getCorrectedExpiryDate() != null) {
+            donation.setDoctorCorrectedExpiryDate(request.getCorrectedExpiryDate());
+        }
+    }
+
+    private boolean hasCorrectedBrand(Donation d) {
+        return d.getDoctorCorrectedBrandName() != null &&
+                !d.getDoctorCorrectedBrandName().isBlank();
+    }
+
+    private boolean hasCorrectedStrength(Donation d) {
+        return d.getDoctorCorrectedStrength() != null &&
+                !d.getDoctorCorrectedStrength().isBlank();
+    }
+
+    private boolean hasCorrectedDosageForm(Donation d) {
+        return d.getDoctorCorrectedDosageForm() != null &&
+                !d.getDoctorCorrectedDosageForm().isBlank();
     }
 
     // ─────────────────────────────────────────

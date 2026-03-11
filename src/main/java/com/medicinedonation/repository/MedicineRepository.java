@@ -95,7 +95,7 @@ public interface MedicineRepository extends JpaRepository<Medicine, Long> {
     );
 }*/
 
-package com.medicinedonation.repository;
+/*package com.medicinedonation.repository;
 
 import com.medicinedonation.model.Medicine;
 import com.medicinedonation.model.User;
@@ -154,6 +154,157 @@ public interface MedicineRepository extends JpaRepository<Medicine, Long> {
     // ✅ NEW — used by doctor to check exact match before approving
     // Checks brand name + strength + dosage form (3-way match)
     Optional<Medicine> findByBrandNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCase(
+            String brandName,
+            String strength,
+            String dosageForm
+    );
+}*/
+
+
+/*package com.medicinedonation.repository;
+
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.model.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface MedicineRepository extends JpaRepository<Medicine, Long> {
+
+    // ─────────────────────────────────────────
+    // MATCHING ENGINE
+    // ─────────────────────────────────────────
+
+    // Tier 1 — exact match
+    List<Medicine> findByApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+            String apiName,
+            String strength,
+            String dosageForm,
+            String route
+    );
+
+    // Tier 2 — same API different strength
+    List<Medicine> findByApiNameIgnoreCaseAndDosageFormIgnoreCase(
+            String apiName,
+            String dosageForm
+    );
+
+    // ─────────────────────────────────────────
+    // SEARCH
+    // ─────────────────────────────────────────
+
+    // ✅ FIXED — returns List to handle multiple brands with same name (e.g. Panadol 500mg, Panadol Extra)
+    // Was Optional — caused IncorrectResultSizeDataAccessException when multiple entries exist
+    List<Medicine> findByBrandNameIgnoreCase(String brandName);
+
+    // ✅ NEW — LIKE search for brand name (partial match support)
+    @Query("SELECT m FROM Medicine m WHERE LOWER(m.brandName) LIKE LOWER(CONCAT('%', :brandName, '%'))")
+    List<Medicine> searchByBrandNameContaining(@Param("brandName") String brandName);
+
+    List<Medicine> findByApiNameIgnoreCase(String apiName);
+
+    // ─────────────────────────────────────────
+    // FILTERS
+    // ─────────────────────────────────────────
+
+    List<Medicine> findByPharmacistVerified(boolean pharmacistVerified);
+    List<Medicine> findByVerifiedBy(User verifiedBy);
+
+    // ─────────────────────────────────────────
+    // DUPLICATE CHECK
+    // ─────────────────────────────────────────
+
+    boolean existsByBrandNameIgnoreCaseAndApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+            String brandName,
+            String apiName,
+            String strength,
+            String dosageForm,
+            String route
+    );
+
+    // ✅ 3-way exact match — brand + strength + dosageForm
+    // Returns List to safely handle duplicates — caller picks first match
+    List<Medicine> findByBrandNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCase(
+            String brandName,
+            String strength,
+            String dosageForm
+    );
+}*/
+
+package com.medicinedonation.repository;
+
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.model.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface MedicineRepository extends JpaRepository<Medicine, Long> {
+
+    // ─────────────────────────────────────────
+    // MATCHING ENGINE
+    // ─────────────────────────────────────────
+
+    // Tier 1 — exact match
+    List<Medicine> findByApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+            String apiName,
+            String strength,
+            String dosageForm,
+            String route
+    );
+
+    // Tier 2 — same API different strength
+    List<Medicine> findByApiNameIgnoreCaseAndDosageFormIgnoreCase(
+            String apiName,
+            String dosageForm
+    );
+
+    // ─────────────────────────────────────────
+    // SEARCH
+    // ─────────────────────────────────────────
+
+    // ✅ FIXED — returns List to handle multiple brands with same name (e.g. Panadol 500mg, Panadol Extra)
+    // Was Optional — caused IncorrectResultSizeDataAccessException when multiple entries exist
+    // ✅ Standard lookup — caller must normalize input first
+    List<Medicine> findByBrandNameIgnoreCase(String brandName);
+
+
+    // ✅ NEW — LIKE search for brand name (partial match support)
+    @Query("SELECT m FROM Medicine m WHERE LOWER(m.brandName) LIKE LOWER(CONCAT('%', :brandName, '%'))")
+    List<Medicine> searchByBrandNameContaining(@Param("brandName") String brandName);
+
+    List<Medicine> findByApiNameIgnoreCase(String apiName);
+
+    // ─────────────────────────────────────────
+    // FILTERS
+    // ─────────────────────────────────────────
+
+    List<Medicine> findByPharmacistVerified(boolean pharmacistVerified);
+    List<Medicine> findByVerifiedBy(User verifiedBy);
+
+    // ─────────────────────────────────────────
+    // DUPLICATE CHECK
+    // ─────────────────────────────────────────
+
+    boolean existsByBrandNameIgnoreCaseAndApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+            String brandName,
+            String apiName,
+            String strength,
+            String dosageForm,
+            String route
+    );
+
+    // ✅ 3-way exact match — brand + strength + dosageForm
+    // Returns List to safely handle duplicates — caller picks first match
+    List<Medicine> findByBrandNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCase(
             String brandName,
             String strength,
             String dosageForm

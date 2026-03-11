@@ -314,7 +314,7 @@ public class MedicineService {
     }
 }*/
 
-package com.medicinedonation.service;
+/*package com.medicinedonation.service;
 
 import com.medicinedonation.dto.request.MedicineRequest;
 import com.medicinedonation.dto.response.AvailableDonationResponse;
@@ -603,6 +603,651 @@ public class MedicineService {
                         medicine.getVerifiedBy().getName() : null)
                 .addedAt(medicine.getAddedAt())
                 .build();
+    }
+
+    private AvailableDonationResponse mapToAvailableDonation(
+            Donation donation, String tier) {
+
+        Medicine m = donation.getMedicine();
+
+        return AvailableDonationResponse.builder()
+                .donationId(donation.getId())
+                .brandName(m.getBrandName())
+                .apiName(m.getApiName())
+                .strength(m.getStrength())
+                .dosageForm(m.getDosageForm())
+                .route(m.getRoute())
+                .schedule(m.getSchedule().name())
+                .quantity(donation.getQuantity())
+                .expiryDate(donation.getExpiryDate())
+                .doctorVerified(donation.getApprovedByDoctor() != null)
+                .doctorName(donation.getApprovedByDoctor() != null ?
+                        donation.getApprovedByDoctor().getName() : null)
+                .collectionPointId(donation.getCollectionPoint() != null ?
+                        donation.getCollectionPoint().getId() : null)
+                .collectionPointName(donation.getCollectionPoint() != null ?
+                        donation.getCollectionPoint().getLocationName() : null)
+                .collectionPointAddress(
+                        donation.getCollectionPoint() != null ?
+                                donation.getCollectionPoint().getAddress() : null)
+                .collectionPointDistrict(
+                        donation.getCollectionPoint() != null ?
+                                donation.getCollectionPoint().getDistrict() : null)
+                .collectionPointPhone(
+                        donation.getCollectionPoint() != null ?
+                                donation.getCollectionPoint().getPhone() : null)
+                .matchTier(tier)
+                .build();
+    }
+}*/
+
+
+/*package com.medicinedonation.service;
+
+import com.medicinedonation.dto.request.MedicineRequest;
+import com.medicinedonation.dto.response.AvailableDonationResponse;
+import com.medicinedonation.dto.response.MatchResultResponse;
+import com.medicinedonation.dto.response.MedicineResponse;
+import com.medicinedonation.enums.DonationStatus;
+import com.medicinedonation.model.Donation;
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.repository.DonationRepository;
+import com.medicinedonation.repository.MedicineRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+public class MedicineService {
+
+    @Autowired
+    private MedicineRepository medicineRepository;
+
+    @Autowired
+    private DonationRepository donationRepository;
+
+    // ─────────────────────────────────────────
+    // SEARCH BY BRAND NAME
+    // ─────────────────────────────────────────
+
+    public MatchResultResponse searchByBrandName(String brandName) {
+
+        // ✅ FIXED — now returns List, pick first match
+        List<Medicine> medicines =
+                medicineRepository.findByBrandNameIgnoreCase(brandName);
+
+        if (medicines.isEmpty()) {
+            return MatchResultResponse.builder()
+                    .matchTier("NO_MATCH")
+                    .searchedBrandName(brandName)
+                    .matches(new ArrayList<>())
+                    .message("No medicine found with brand name: " + brandName)
+                    .build();
+        }
+
+        // Use first match to drive the matching engine
+        Medicine medicine = medicines.get(0);
+
+        return runMatchingEngine(
+                medicine.getApiName(),
+                medicine.getStrength(),
+                medicine.getDosageForm(),
+                medicine.getRoute(),
+                brandName,
+                null
+        );
+    }
+
+    // ─────────────────────────────────────────
+    // SEARCH BY API NAME
+    // ─────────────────────────────────────────
+
+    public MatchResultResponse searchByApiName(String apiName) {
+
+        List<Medicine> medicines =
+                medicineRepository.findByApiNameIgnoreCase(apiName);
+
+        if (medicines.isEmpty()) {
+            return MatchResultResponse.builder()
+                    .matchTier("NO_MATCH")
+                    .searchedApiName(apiName)
+                    .matches(new ArrayList<>())
+                    .message("No medicine found with API name: " + apiName)
+                    .build();
+        }
+
+        Medicine first = medicines.get(0);
+
+        return runMatchingEngine(
+                apiName,
+                first.getStrength(),
+                first.getDosageForm(),
+                first.getRoute(),
+                null,
+                apiName
+        );
+    }
+
+    // ─────────────────────────────────────────
+    // MATCHING ENGINE — CORE LOGIC
+    // ─────────────────────────────────────────
+
+    private MatchResultResponse runMatchingEngine(
+            String apiName,
+            String strength,
+            String dosageForm,
+            String route,
+            String searchedBrandName,
+            String searchedApiName) {
+
+        // ── TIER 1 — Exact Match ──────────────
+        List<Medicine> tier1Medicines =
+                medicineRepository
+                        .findByApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+                                apiName, strength, dosageForm, route);
+
+        List<AvailableDonationResponse> tier1Results =
+                getLiveDonationsForMedicines(tier1Medicines, "TIER_1");
+
+        if (!tier1Results.isEmpty()) {
+            return MatchResultResponse.builder()
+                    .matchTier("TIER_1")
+                    .searchedBrandName(searchedBrandName)
+                    .searchedApiName(searchedApiName)
+                    .matches(tier1Results)
+                    .message("Exact match found — " +
+                            tier1Results.size() + " available")
+                    .build();
+        }
+
+        // ── TIER 2 — Same API Different Strength ──
+        List<Medicine> tier2Medicines =
+                medicineRepository
+                        .findByApiNameIgnoreCaseAndDosageFormIgnoreCase(
+                                apiName, dosageForm);
+
+        tier2Medicines = tier2Medicines.stream()
+                .filter(m -> !m.getStrength().equalsIgnoreCase(strength))
+                .collect(Collectors.toList());
+
+        List<AvailableDonationResponse> tier2Results =
+                getLiveDonationsForMedicines(tier2Medicines, "TIER_2");
+
+        if (!tier2Results.isEmpty()) {
+            String availableStrengths = tier2Results.stream()
+                    .map(AvailableDonationResponse::getStrength)
+                    .distinct()
+                    .collect(Collectors.joining(", "));
+
+            return MatchResultResponse.builder()
+                    .matchTier("TIER_2")
+                    .searchedBrandName(searchedBrandName)
+                    .searchedApiName(searchedApiName)
+                    .matches(tier2Results)
+                    .message("Exact strength (" + strength + ") is not " +
+                            "currently available. Similar medicines found " +
+                            "in different strengths: " + availableStrengths +
+                            ". Please select as per your prescription.")
+                    .build();
+        }
+
+        // ── NO MATCH ──────────────────────────
+        return MatchResultResponse.builder()
+                .matchTier("NO_MATCH")
+                .searchedBrandName(searchedBrandName)
+                .searchedApiName(searchedApiName)
+                .matches(new ArrayList<>())
+                .message("No available donations found for: " + apiName)
+                .build();
+    }
+
+    // ─────────────────────────────────────────
+    // GET LIVE DONATIONS FOR MEDICINES
+    // ─────────────────────────────────────────
+
+    private List<AvailableDonationResponse> getLiveDonationsForMedicines(
+            List<Medicine> medicines, String tier) {
+
+        List<AvailableDonationResponse> results = new ArrayList<>();
+
+        for (Medicine medicine : medicines) {
+            List<Donation> liveDonations =
+                    donationRepository.findByStatus(DonationStatus.LIVE)
+                            .stream()
+                            .filter(d -> d.getMedicine() != null &&
+                                    d.getMedicine().getId()
+                                            .equals(medicine.getId()))
+                            .collect(Collectors.toList());
+
+            for (Donation donation : liveDonations) {
+                results.add(mapToAvailableDonation(donation, tier));
+            }
+        }
+
+        return results;
+    }
+
+    // ─────────────────────────────────────────
+    // CHECK IF MEDICINE EXISTS IN DB
+    // Used by donation submission flow
+    // ✅ FIXED — returns Optional by checking if list is non-empty
+    // ─────────────────────────────────────────
+
+    public Optional<Medicine> findByBrandName(String brandName) {
+        List<Medicine> matches =
+                medicineRepository.findByBrandNameIgnoreCase(brandName);
+        return matches.isEmpty() ? Optional.empty() : Optional.of(matches.get(0));
+    }
+
+    // ─────────────────────────────────────────
+    // ADD MEDICINE — used by pharmacist service
+    // ─────────────────────────────────────────
+
+    public Medicine addMedicineFromPharmacist(
+            MedicineRequest request,
+            com.medicinedonation.model.User pharmacist) {
+
+        boolean exists = medicineRepository
+                .existsByBrandNameIgnoreCaseAndApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+                        request.getBrandName(),
+                        request.getApiName(),
+                        request.getStrength(),
+                        request.getDosageForm(),
+                        request.getRoute()
+                );
+
+        if (exists) {
+            throw new RuntimeException(
+                    "Medicine already exists in database: " +
+                            request.getBrandName() + " " +
+                            request.getStrength() + " " +
+                            request.getDosageForm()
+            );
+        }
+
+        Medicine medicine = Medicine.builder()
+                .brandName(request.getBrandName())
+                .apiName(request.getApiName())
+                .strength(request.getStrength())
+                .dosageForm(request.getDosageForm())
+                .route(request.getRoute())
+                .schedule(request.getSchedule())
+                .pharmacistVerified(true)
+                .verifiedBy(pharmacist)
+                .build();
+
+        return medicineRepository.save(medicine);
+    }
+
+    // ─────────────────────────────────────────
+    // GET ALL MEDICINES — public listing
+    // ─────────────────────────────────────────
+
+    public List<MedicineResponse> getAllMedicines() {
+        return medicineRepository.findAll()
+                .stream()
+                .map(this::mapToMedicineResponse)
+                .collect(Collectors.toList());
+    }
+
+    public MedicineResponse getMedicineById(Long id) {
+        Medicine medicine = medicineRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException(
+                        "Medicine not found with id: " + id));
+        return mapToMedicineResponse(medicine);
+    }
+
+    // ─────────────────────────────────────────
+    // MAPPERS
+    // ─────────────────────────────────────────
+
+    public MedicineResponse mapToMedicineResponse(Medicine medicine) {
+        return MedicineResponse.builder()
+                .id(medicine.getId())
+                .brandName(medicine.getBrandName())
+                .apiName(medicine.getApiName())
+                .strength(medicine.getStrength())
+                .dosageForm(medicine.getDosageForm())
+                .route(medicine.getRoute())
+                .schedule(medicine.getSchedule().name())
+                .pharmacistVerified(medicine.isPharmacistVerified())
+                .verifiedByName(medicine.getVerifiedBy() != null ?
+                        medicine.getVerifiedBy().getName() : null)
+                .addedAt(medicine.getAddedAt())
+                .build();
+    }
+
+    private AvailableDonationResponse mapToAvailableDonation(
+            Donation donation, String tier) {
+
+        Medicine m = donation.getMedicine();
+
+        return AvailableDonationResponse.builder()
+                .donationId(donation.getId())
+                .brandName(m.getBrandName())
+                .apiName(m.getApiName())
+                .strength(m.getStrength())
+                .dosageForm(m.getDosageForm())
+                .route(m.getRoute())
+                .schedule(m.getSchedule().name())
+                .quantity(donation.getQuantity())
+                .expiryDate(donation.getExpiryDate())
+                .doctorVerified(donation.getApprovedByDoctor() != null)
+                .doctorName(donation.getApprovedByDoctor() != null ?
+                        donation.getApprovedByDoctor().getName() : null)
+                .collectionPointId(donation.getCollectionPoint() != null ?
+                        donation.getCollectionPoint().getId() : null)
+                .collectionPointName(donation.getCollectionPoint() != null ?
+                        donation.getCollectionPoint().getLocationName() : null)
+                .collectionPointAddress(
+                        donation.getCollectionPoint() != null ?
+                                donation.getCollectionPoint().getAddress() : null)
+                .collectionPointDistrict(
+                        donation.getCollectionPoint() != null ?
+                                donation.getCollectionPoint().getDistrict() : null)
+                .collectionPointPhone(
+                        donation.getCollectionPoint() != null ?
+                                donation.getCollectionPoint().getPhone() : null)
+                .matchTier(tier)
+                .build();
+    }
+}*/
+
+package com.medicinedonation.service;
+
+import com.medicinedonation.dto.request.MedicineRequest;
+import com.medicinedonation.dto.response.AvailableDonationResponse;
+import com.medicinedonation.dto.response.MatchResultResponse;
+import com.medicinedonation.dto.response.MedicineResponse;
+import com.medicinedonation.enums.DonationStatus;
+import com.medicinedonation.model.Donation;
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.repository.DonationRepository;
+import com.medicinedonation.repository.MedicineRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+public class MedicineService {
+
+    @Autowired
+    private MedicineRepository medicineRepository;
+
+    @Autowired
+    private DonationRepository donationRepository;
+
+    // ─────────────────────────────────────────
+    // SEARCH BY BRAND NAME
+    // ─────────────────────────────────────────
+
+    public MatchResultResponse searchByBrandName(String brandName) {
+
+        // ✅ FIXED — now returns List, pick first match
+        // ✅ Normalize spaces before lookup
+        String normalizedBrand = brandName == null ? null : brandName.trim().replaceAll("\\s+", " ");
+        List<Medicine> medicines =
+                medicineRepository.findByBrandNameIgnoreCase(normalizedBrand);
+
+        if (medicines.isEmpty()) {
+            return MatchResultResponse.builder()
+                    .matchTier("NO_MATCH")
+                    .searchedBrandName(brandName)
+                    .matches(new ArrayList<>())
+                    .message("No medicine found with brand name: " + brandName)
+                    .build();
+        }
+
+        // Use first match to drive the matching engine
+        Medicine medicine = medicines.get(0);
+
+        return runMatchingEngine(
+                medicine.getApiName(),
+                medicine.getStrength(),
+                medicine.getDosageForm(),
+                medicine.getRoute(),
+                brandName,
+                null
+        );
+    }
+
+    // ─────────────────────────────────────────
+    // SEARCH BY API NAME
+    // ─────────────────────────────────────────
+
+    public MatchResultResponse searchByApiName(String apiName) {
+
+        List<Medicine> medicines =
+                medicineRepository.findByApiNameIgnoreCase(apiName);
+
+        if (medicines.isEmpty()) {
+            return MatchResultResponse.builder()
+                    .matchTier("NO_MATCH")
+                    .searchedApiName(apiName)
+                    .matches(new ArrayList<>())
+                    .message("No medicine found with API name: " + apiName)
+                    .build();
+        }
+
+        Medicine first = medicines.get(0);
+
+        return runMatchingEngine(
+                apiName,
+                first.getStrength(),
+                first.getDosageForm(),
+                first.getRoute(),
+                null,
+                apiName
+        );
+    }
+
+    // ─────────────────────────────────────────
+    // MATCHING ENGINE — CORE LOGIC
+    // ─────────────────────────────────────────
+
+    private MatchResultResponse runMatchingEngine(
+            String apiName,
+            String strength,
+            String dosageForm,
+            String route,
+            String searchedBrandName,
+            String searchedApiName) {
+
+        // ── TIER 1 — Exact Match ──────────────
+        List<Medicine> tier1Medicines =
+                medicineRepository
+                        .findByApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+                                apiName, strength, dosageForm, route);
+
+        List<AvailableDonationResponse> tier1Results =
+                getLiveDonationsForMedicines(tier1Medicines, "TIER_1");
+
+        if (!tier1Results.isEmpty()) {
+            return MatchResultResponse.builder()
+                    .matchTier("TIER_1")
+                    .searchedBrandName(searchedBrandName)
+                    .searchedApiName(searchedApiName)
+                    .matches(tier1Results)
+                    .message("Exact match found — " +
+                            tier1Results.size() + " available")
+                    .build();
+        }
+
+        // ── TIER 2 — Same API Different Strength ──
+        List<Medicine> tier2Medicines =
+                medicineRepository
+                        .findByApiNameIgnoreCaseAndDosageFormIgnoreCase(
+                                apiName, dosageForm);
+
+        tier2Medicines = tier2Medicines.stream()
+                .filter(m -> !m.getStrength().equalsIgnoreCase(strength))
+                .collect(Collectors.toList());
+
+        List<AvailableDonationResponse> tier2Results =
+                getLiveDonationsForMedicines(tier2Medicines, "TIER_2");
+
+        if (!tier2Results.isEmpty()) {
+            String availableStrengths = tier2Results.stream()
+                    .map(AvailableDonationResponse::getStrength)
+                    .distinct()
+                    .collect(Collectors.joining(", "));
+
+            return MatchResultResponse.builder()
+                    .matchTier("TIER_2")
+                    .searchedBrandName(searchedBrandName)
+                    .searchedApiName(searchedApiName)
+                    .matches(tier2Results)
+                    .message("Exact strength (" + strength + ") is not " +
+                            "currently available. Similar medicines found " +
+                            "in different strengths: " + availableStrengths +
+                            ". Please select as per your prescription.")
+                    .build();
+        }
+
+        // ── NO MATCH ──────────────────────────
+        return MatchResultResponse.builder()
+                .matchTier("NO_MATCH")
+                .searchedBrandName(searchedBrandName)
+                .searchedApiName(searchedApiName)
+                .matches(new ArrayList<>())
+                .message("No available donations found for: " + apiName)
+                .build();
+    }
+
+    // ─────────────────────────────────────────
+    // GET LIVE DONATIONS FOR MEDICINES
+    // ─────────────────────────────────────────
+
+    private List<AvailableDonationResponse> getLiveDonationsForMedicines(
+            List<Medicine> medicines, String tier) {
+
+        List<AvailableDonationResponse> results = new ArrayList<>();
+
+        for (Medicine medicine : medicines) {
+            List<Donation> liveDonations =
+                    donationRepository.findByStatus(DonationStatus.LIVE)
+                            .stream()
+                            .filter(d -> d.getMedicine() != null &&
+                                    d.getMedicine().getId()
+                                            .equals(medicine.getId()))
+                            .collect(Collectors.toList());
+
+            for (Donation donation : liveDonations) {
+                results.add(mapToAvailableDonation(donation, tier));
+            }
+        }
+
+        return results;
+    }
+
+    // ─────────────────────────────────────────
+    // CHECK IF MEDICINE EXISTS IN DB
+    // Used by donation submission flow
+    // ✅ FIXED — returns Optional by checking if list is non-empty
+    // ─────────────────────────────────────────
+
+    public Optional<Medicine> findByBrandName(String brandName) {
+        if (brandName == null || brandName.isBlank()) return Optional.empty();
+        // ✅ Normalize — "Vitamin  B1" → "Vitamin B1" before DB lookup
+        List<Medicine> matches = medicineRepository.findByBrandNameIgnoreCase(normalize(brandName));
+        return matches.isEmpty() ? Optional.empty() : Optional.of(matches.get(0));
+    }
+
+    // ─────────────────────────────────────────
+    // ADD MEDICINE — used by pharmacist service
+    // ─────────────────────────────────────────
+
+    public Medicine addMedicineFromPharmacist(
+            MedicineRequest request,
+            com.medicinedonation.model.User pharmacist) {
+
+        boolean exists = medicineRepository
+                .existsByBrandNameIgnoreCaseAndApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+                        request.getBrandName(),
+                        request.getApiName(),
+                        request.getStrength(),
+                        request.getDosageForm(),
+                        request.getRoute()
+                );
+
+        if (exists) {
+            throw new RuntimeException(
+                    "Medicine already exists in database: " +
+                            request.getBrandName() + " " +
+                            request.getStrength() + " " +
+                            request.getDosageForm()
+            );
+        }
+
+        // ✅ Normalize ALL fields when saving — prevents dirty data in DB
+        // e.g. "Vitamin  B1" → "Vitamin B1", " Thiamine" → "Thiamine"
+        Medicine medicine = Medicine.builder()
+                .brandName(normalize(request.getBrandName()))
+                .apiName(normalize(request.getApiName()))
+                .strength(normalize(request.getStrength()))
+                .dosageForm(normalize(request.getDosageForm()))
+                .route(normalize(request.getRoute()))
+                .schedule(request.getSchedule())
+                .pharmacistVerified(true)
+                .verifiedBy(pharmacist)
+                .build();
+
+        return medicineRepository.save(medicine);
+    }
+
+    // ─────────────────────────────────────────
+    // GET ALL MEDICINES — public listing
+    // ─────────────────────────────────────────
+
+    public List<MedicineResponse> getAllMedicines() {
+        return medicineRepository.findAll()
+                .stream()
+                .map(this::mapToMedicineResponse)
+                .collect(Collectors.toList());
+    }
+
+    public MedicineResponse getMedicineById(Long id) {
+        Medicine medicine = medicineRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException(
+                        "Medicine not found with id: " + id));
+        return mapToMedicineResponse(medicine);
+    }
+
+    // ─────────────────────────────────────────
+    // MAPPERS
+    // ─────────────────────────────────────────
+
+    public MedicineResponse mapToMedicineResponse(Medicine medicine) {
+        return MedicineResponse.builder()
+                .id(medicine.getId())
+                .brandName(medicine.getBrandName())
+                .apiName(medicine.getApiName())
+                .strength(medicine.getStrength())
+                .dosageForm(medicine.getDosageForm())
+                .route(medicine.getRoute())
+                .schedule(medicine.getSchedule().name())
+                .pharmacistVerified(medicine.isPharmacistVerified())
+                .verifiedByName(medicine.getVerifiedBy() != null ?
+                        medicine.getVerifiedBy().getName() : null)
+                .addedAt(medicine.getAddedAt())
+                .build();
+    }
+
+    // ─────────────────────────────────────────
+    // NORMALIZE — collapse multiple spaces to single, trim edges
+    // ─────────────────────────────────────────
+
+    private String normalize(String s) {
+        if (s == null) return null;
+        return s.trim().replaceAll("\\s+", " ");
     }
 
     private AvailableDonationResponse mapToAvailableDonation(

@@ -514,7 +514,7 @@ public class PharmacistService {
     }
 }*/
 
-package com.medicinedonation.service;
+/*package com.medicinedonation.service;
 
 import com.medicinedonation.dto.request.PharmacistReviewRequest;
 import com.medicinedonation.dto.response.PendingMedicineResponse;
@@ -755,6 +755,279 @@ public class PharmacistService {
                 // ✅ NEW — donor submitted dosage info from donation
                 .donorStrength(pending.getDonation().getStrength())
                 .donorDosageForm(pending.getDonation().getDosageForm())
+                .resolvedApiName(pending.getResolvedApiName())
+                .resolvedStrength(pending.getResolvedStrength())
+                .resolvedDosageForm(pending.getResolvedDosageForm())
+                .resolvedRoute(pending.getResolvedRoute())
+                .resolvedSchedule(pending.getResolvedSchedule() != null ?
+                        pending.getResolvedSchedule().name() : null)
+                .resolved(pending.isResolved())
+                .rejected(pending.isRejected())
+                .rejectionReason(pending.getRejectionReason())
+                .reviewedByPharmacistName(
+                        pending.getReviewedByPharmacist() != null ?
+                                pending.getReviewedByPharmacist().getName() : null)
+                .submittedAt(pending.getSubmittedAt())
+                .resolvedAt(pending.getResolvedAt())
+                .build();
+    }
+}*/
+
+package com.medicinedonation.service;
+
+import com.medicinedonation.dto.request.PharmacistReviewRequest;
+import com.medicinedonation.dto.response.PendingMedicineResponse;
+import com.medicinedonation.enums.DonationStatus;
+import com.medicinedonation.model.Donation;
+import com.medicinedonation.model.Medicine;
+import com.medicinedonation.model.PendingMedicine;
+import com.medicinedonation.model.User;
+import com.medicinedonation.repository.DonationRepository;
+import com.medicinedonation.repository.MedicineRepository;
+import com.medicinedonation.repository.PendingMedicineRepository;
+import com.medicinedonation.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Service
+public class PharmacistService {
+
+    @Autowired
+    private PendingMedicineRepository pendingMedicineRepository;
+
+    @Autowired
+    private DonationRepository donationRepository;
+
+    @Autowired
+    private MedicineRepository medicineRepository;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private DonorService donorService;
+
+    // ─────────────────────────────────────────
+    // GET PENDING MEDICINES
+    // ─────────────────────────────────────────
+
+    public List<PendingMedicineResponse> getPendingMedicines() {
+        return pendingMedicineRepository
+                .findByResolvedFalseAndRejectedFalse()
+                .stream()
+                .map(this::mapToPendingMedicineResponse)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // GET PENDING MEDICINE BY ID
+    // ─────────────────────────────────────────
+
+    public PendingMedicineResponse getPendingMedicineById(Long id) {
+        PendingMedicine pending = pendingMedicineRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException(
+                        "Pending medicine not found with id: " + id));
+        return mapToPendingMedicineResponse(pending);
+    }
+
+    // ─────────────────────────────────────────
+    // ADD MEDICINE TO DATABASE
+    // ─────────────────────────────────────────
+
+    public PendingMedicineResponse addMedicineToDatabase(
+            Long pendingMedicineId,
+            PharmacistReviewRequest request,
+            String pharmacistEmail) {
+
+        PendingMedicine pending =
+                pendingMedicineRepository.findById(pendingMedicineId)
+                        .orElseThrow(() -> new RuntimeException(
+                                "Pending medicine not found with id: "
+                                        + pendingMedicineId));
+
+        if (pending.isResolved() || pending.isRejected()) {
+            throw new RuntimeException(
+                    "This pending medicine has already been reviewed.");
+        }
+
+        User pharmacist = userRepository.findByEmail(pharmacistEmail)
+                .orElseThrow(() -> new RuntimeException(
+                        "Pharmacist not found"));
+
+        // ✅ Use pharmacist's corrected brand name if provided,
+        // else pending's brand name (which is already doctor's corrected name if doctor edited)
+        String finalBrandName = (request.getResolvedBrandName() != null &&
+                !request.getResolvedBrandName().isBlank())
+                ? request.getResolvedBrandName()
+                : pending.getBrandName();
+
+        boolean exists = medicineRepository
+                .existsByBrandNameIgnoreCaseAndApiNameIgnoreCaseAndStrengthIgnoreCaseAndDosageFormIgnoreCaseAndRouteIgnoreCase(
+                        finalBrandName,
+                        request.getResolvedApiName(),
+                        request.getResolvedStrength(),
+                        request.getResolvedDosageForm(),
+                        request.getResolvedRoute()
+                );
+
+        if (exists) {
+            throw new RuntimeException(
+                    "Medicine already exists in database: " +
+                            finalBrandName + " " +
+                            request.getResolvedStrength() + " " +
+                            request.getResolvedDosageForm());
+        }
+
+        Medicine medicine = Medicine.builder()
+                .brandName(finalBrandName)
+                .apiName(request.getResolvedApiName())
+                .strength(request.getResolvedStrength())
+                .dosageForm(request.getResolvedDosageForm())
+                .route(request.getResolvedRoute())
+                .schedule(request.getResolvedSchedule())
+                .pharmacistVerified(true)
+                .verifiedBy(pharmacist)
+                .build();
+
+        Medicine savedMedicine = medicineRepository.save(medicine);
+
+        pending.setResolvedApiName(request.getResolvedApiName());
+        pending.setResolvedStrength(request.getResolvedStrength());
+        pending.setResolvedDosageForm(request.getResolvedDosageForm());
+        pending.setResolvedRoute(request.getResolvedRoute());
+        pending.setResolvedSchedule(request.getResolvedSchedule());
+        pending.setResolved(true);
+        pending.setReviewedByPharmacist(pharmacist);
+        pending.setResolvedAt(LocalDateTime.now());
+
+        pendingMedicineRepository.save(pending);
+
+        Donation donation = pending.getDonation();
+        donation.setMedicine(savedMedicine);
+        donation.setStatus(DonationStatus.PENDING_DOCTOR_RECHECK);
+        donationRepository.save(donation);
+
+        return mapToPendingMedicineResponse(pending);
+    }
+
+    // ─────────────────────────────────────────
+    // REJECT MEDICINE
+    // ─────────────────────────────────────────
+
+    public PendingMedicineResponse rejectMedicine(
+            Long pendingMedicineId,
+            PharmacistReviewRequest request,
+            String pharmacistEmail) {
+
+        PendingMedicine pending =
+                pendingMedicineRepository.findById(pendingMedicineId)
+                        .orElseThrow(() -> new RuntimeException(
+                                "Pending medicine not found with id: "
+                                        + pendingMedicineId));
+
+        if (pending.isResolved() || pending.isRejected()) {
+            throw new RuntimeException(
+                    "This pending medicine has already been reviewed.");
+        }
+
+        User pharmacist = userRepository.findByEmail(pharmacistEmail)
+                .orElseThrow(() -> new RuntimeException(
+                        "Pharmacist not found"));
+
+        pending.setRejected(true);
+        pending.setRejectionReason(request.getRejectionReason());
+        pending.setReviewedByPharmacist(pharmacist);
+        pending.setResolvedAt(LocalDateTime.now());
+
+        pendingMedicineRepository.save(pending);
+
+        Donation donation = pending.getDonation();
+        donation.setPharmacistRejectionReason(request.getRejectionReason());
+        donation.setStatus(DonationStatus.PHARMACIST_REJECTED);
+        donationRepository.save(donation);
+
+        return mapToPendingMedicineResponse(pending);
+    }
+
+    // ─────────────────────────────────────────
+    // GET RESOLUTION HISTORY
+    // ─────────────────────────────────────────
+
+    public List<PendingMedicineResponse> getResolutionHistory(
+            String pharmacistEmail) {
+
+        User pharmacist = userRepository.findByEmail(pharmacistEmail)
+                .orElseThrow(() -> new RuntimeException(
+                        "Pharmacist not found"));
+
+        return pendingMedicineRepository.findAll()
+                .stream()
+                .filter(p -> p.getReviewedByPharmacist() != null &&
+                        p.getReviewedByPharmacist().getId()
+                                .equals(pharmacist.getId()))
+                .map(this::mapToPendingMedicineResponse)
+                .collect(Collectors.toList());
+    }
+
+    // ─────────────────────────────────────────
+    // DASHBOARD COUNTS
+    // ─────────────────────────────────────────
+
+    public Map<String, Long> getDashboardCounts() {
+        Map<String, Long> counts = new HashMap<>();
+
+        counts.put("pendingMedicines",
+                pendingMedicineRepository
+                        .countByResolvedFalseAndRejectedFalse());
+
+        counts.put("totalVerified",
+                pendingMedicineRepository.countByResolvedTrue());
+
+        counts.put("totalRejected",
+                pendingMedicineRepository.countByRejectedTrue());
+
+        return counts;
+    }
+
+    // ─────────────────────────────────────────
+    // MAPPER
+    // ✅ donorStrength/donorDosageForm uses doctor's corrected values
+    //    if available, else falls back to donor's original
+    // ─────────────────────────────────────────
+
+    private PendingMedicineResponse mapToPendingMedicineResponse(
+            PendingMedicine pending) {
+
+        Donation donation = pending.getDonation();
+
+        return PendingMedicineResponse.builder()
+                .id(pending.getId())
+                .donationId(donation.getId())
+                .donorName(donation.getDonor().getName())
+                .brandName(pending.getBrandName())
+                .photoUrl(pending.getPhotoUrl())
+                .packageInsertUrl(pending.getPackageInsertUrl())
+                .doctorNotes(pending.getDoctorNotes())
+                // ✅ Pharmacist sees doctor's corrected details if available,
+                //    else donor's original
+                .donorStrength(
+                        donation.getDoctorCorrectedStrength() != null &&
+                                !donation.getDoctorCorrectedStrength().isBlank()
+                                ? donation.getDoctorCorrectedStrength()
+                                : donation.getStrength()
+                )
+                .donorDosageForm(
+                        donation.getDoctorCorrectedDosageForm() != null &&
+                                !donation.getDoctorCorrectedDosageForm().isBlank()
+                                ? donation.getDoctorCorrectedDosageForm()
+                                : donation.getDosageForm()
+                )
                 .resolvedApiName(pending.getResolvedApiName())
                 .resolvedStrength(pending.getResolvedStrength())
                 .resolvedDosageForm(pending.getResolvedDosageForm())
